@@ -9,7 +9,7 @@ from skimage import measure
 import trimesh
 import matplotlib.cm as cm
 
-app = Flask(__name__)
+app = Flask(__name__)   
 CORS(app)  # Enable CORS for all routes
 
 # Define absolute paths
