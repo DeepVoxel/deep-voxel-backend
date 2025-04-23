@@ -5,28 +5,24 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
-import nibabel as nib
-from PIL import Image
-from PIL import ImageOps
-from io import BytesIO
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 import base64
-import traceback
+from io import BytesIO
+from werkzeug.utils import secure_filename
+import nibabel as nib
+from PIL import Image, ImageOps
 from skimage import measure
 import trimesh
 import glob
-from werkzeug.utils import secure_filename
 
-# Flask imports
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-
-# MONAI imports
-from monai.data import Dataset
+from monai.apps import DecathlonDataset
+from monai.data import DataLoader, decollate_batch, Dataset
 from monai.inferers import sliding_window_inference
 from monai.networks.nets import SwinUNETR
 from monai.transforms import (
     Activations,
-    AsDiscrete, 
+    AsDiscrete,
     Compose,
     LoadImaged,
     MapTransform,
@@ -36,12 +32,13 @@ from monai.transforms import (
     EnsureTyped,
     EnsureChannelFirstd,
 )
+from monai.utils import set_determinism
 
-# Set matplotlib to use non-GUI backend
+# Use non-GUI backend
 matplotlib.use('Agg')
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
 # Define absolute paths
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -49,24 +46,82 @@ UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 STATIC_FOLDER = os.path.join(BASE_DIR, 'static')
 GIF_FOLDER = os.path.join(STATIC_FOLDER, 'gifs')
 MODEL_FOLDER = os.path.join(STATIC_FOLDER, 'models')
-DATASET_FOLDER = os.path.join(BASE_DIR, 'dataset')
-PYTHON_FOLDER = os.path.join(BASE_DIR, 'python')
 
 # Ensure directories exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(GIF_FOLDER, exist_ok=True)
 os.makedirs(MODEL_FOLDER, exist_ok=True)
-os.makedirs(DATASET_FOLDER, exist_ok=True)
-os.makedirs(PYTHON_FOLDER, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['GIF_FOLDER'] = GIF_FOLDER
 app.config['MODEL_FOLDER'] = MODEL_FOLDER
 
-# Global variable for model and dataset
-model = None
-datalist = None
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ===== Dataset preparation =====
+# Get sorted file paths and file names
+file_paths1 = glob.glob('./dataset/*')
+file_paths1.sort()
+
+file_names1 = [os.path.basename(path) for path in file_paths1]
+file_names1.sort()
+
+# Initialize lists for different MRI modalities and segmentation labels
+t1c, t1n, t2f, t2w, label = [], [], [], [], []
+
+# Use the total number of files instead of a fixed 330
+num_files = len(file_paths1)
+
+# Populate the lists with file paths
+for i in range(num_files):
+    t1c.append(os.path.join(file_paths1[i], file_names1[i] + '-t1c.nii.gz'))
+    t1n.append(os.path.join(file_paths1[i], file_names1[i] + '-t1n.nii.gz'))
+    t2f.append(os.path.join(file_paths1[i], file_names1[i] + '-t2f.nii.gz'))
+    t2w.append(os.path.join(file_paths1[i], file_names1[i] + '-t2w.nii.gz'))
+    label.append(os.path.join(file_paths1[i], file_names1[i] + '-seg.nii.gz'))
+
+# Store in a dictionary with combined image modalities and separate label
+file_list = []
+for i in range(num_files):
+    file_list.append({
+        "image": [t1c[i], t1n[i], t2f[i], t2w[i]],  # Combine modalities into one "image" field
+        "label": label[i]
+    })
+
+file_json = {
+    "training": file_list
+}
+
+# Save to JSON file
+file_path = 'python/dataset.json'
+os.makedirs(os.path.dirname(file_path), exist_ok=True)
+with open(file_path, 'w') as json_file:
+    json.dump(file_json, json_file, indent=4)
+
+# Define path to dataset and model
+root_dir = 'python/'
+dataset_path = "python/dataset.json"
+
+# ===== MRI PROCESSING CLASSES =====
+class ConvertLabels(MapTransform):
+    """
+    Convert labels to multi channels based on BRATS 2023 classes:
+    label 1 is Necrotic Tumor Core (NCR)
+    label 2 is Edema (ED)
+    label 3 is Enhancing Tumor (ET)
+    label 0 is everything else (non-tumor)
+    """
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.keys:
+            result = []
+            # Tumor Core (TC) = NCR + Enhancing Tumor (ET)
+            result.append(torch.logical_or(d[key] == 1, d[key] == 3))
+            # Whole Tumor (WT) = NCR + Edema + Enhancing Tumor
+            result.append(torch.logical_or(torch.logical_or(d[key] == 1, d[key] == 2), d[key] == 3))
+            # Enhancing Tumor (ET) = Enhancing Tumor (label 3)
+            result.append(d[key] == 3)
+            d[key] = torch.stack(result, axis=0).float()
+        return d
 
 class ImageToGIF:
     def __init__(self):
@@ -85,6 +140,70 @@ class ImageToGIF:
             raise ValueError("No frames to save")
         self.frames[0].save(filename, save_all=True, append_images=self.frames[1:], loop=0, duration=1000/fps)
 
+# Define transforms
+val_transform = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys="image"),
+    EnsureTyped(keys=["image", "label"]),
+    ConvertLabels(keys="label"),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    Spacingd(
+        keys=["image", "label"],
+        pixdim=(1.0, 1.0, 1.0),
+        mode=("bilinear", "nearest"),
+    ),
+    NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+])
+
+# Load dataset
+with open(dataset_path) as f:
+    datalist = json.load(f)["training"]
+
+# Initialize model and device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = SwinUNETR(
+    img_size=(96, 96, 96),
+    in_channels=4,
+    out_channels=3,
+    feature_size=24,
+    use_checkpoint=True,
+)
+
+# Load model weights
+model_path = os.path.join(root_dir, "best_distilled_model.pth")
+model.load_state_dict(torch.load(model_path, map_location=device))
+model = model.to(device)
+model.eval()
+
+# Post-processing
+post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
+
+# Define color scheme
+class_colors = [
+    [0.7, 0.7, 0.7, 1],        # Background (neutral gray)
+    [0.85, 0.37, 0.35, 0.7],   # Class 1 (rust red)
+    [0.46, 0.78, 0.56, 0.7],   # Class 2 (sage green)
+    [0.31, 0.51, 0.9, 0.7]     # Class 3 (medium blue)
+]
+custom_cmap = ListedColormap(class_colors)
+class_names = ["Tumor Core", "Whole Tumor", "Enhancing"]
+class_cmaps = ['RdPu', 'BuGn', 'PuBu']
+
+# ===== HELPER FUNCTIONS =====
+def get_sample_by_id(idx):
+    """Get a sample from the dataset by ID"""
+    val_ds = Dataset(data=[datalist[idx]], transform=val_transform)
+    return val_ds[0]
+
+def fig_to_base64(fig):
+    """Convert matplotlib figure to base64 string"""
+    buf = BytesIO()
+    fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+    buf.seek(0)
+    img_str = base64.b64encode(buf.read()).decode('utf-8')
+    buf.close()
+    plt.close(fig)
+    return img_str
 
 def create_gif_from_slices(nifti_file, mask_file, output_filename, orientation):
     img = nib.load(nifti_file).get_fdata()
@@ -107,7 +226,6 @@ def create_gif_from_slices(nifti_file, mask_file, output_filename, orientation):
     for i in range(0, slices, step):
         gif_maker.add(get_image(i), get_mask(i))
     gif_maker.save(output_filename)
-
 
 def create_3d_models(nifti_file, mask_file, output_base):
     """Create a single 3D model: cutaway brain with tumor, fuller brain."""
@@ -135,7 +253,7 @@ def create_3d_models(nifti_file, mask_file, output_base):
         brain_mesh.visual.face_colors = [220, 220, 220, 255]  # Light gray
     except Exception as e:
         print(f"Failed to create brain mesh: {e}")
-        return model_paths # if no brain mesh, no other meshes.
+        return model_paths  # if no brain mesh, no other meshes.
 
     # APPROACH 2: Create a mesh for just the tumor with bright colors
     tumor_meshes = []
@@ -176,223 +294,10 @@ def create_3d_models(nifti_file, mask_file, output_base):
 
     return model_paths
 
+# ===== API ROUTES =====
 
-def fig_to_base64(fig):
-    """Convert matplotlib figure to base64 string"""
-    buf = BytesIO()
-    fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-    buf.seek(0)
-    img_str = base64.b64encode(buf.read()).decode('utf-8')
-    buf.close()
-    plt.close(fig)
-    return img_str
-
-
-class ConvertLabels(MapTransform):
-    """
-    Convert labels to multi channels based on BRATS 2023 classes:
-    label 1 is Necrotic Tumor Core (NCR)
-    label 2 is Edema (ED)
-    label 3 is Enhancing Tumor (ET)
-    label 0 is everything else (non-tumor)
-    """
-    def __call__(self, data):
-        d = dict(data)
-        for key in self.keys:
-            result = []
-            # Tumor Core (TC) = NCR + Enhancing Tumor (ET)
-            result.append(torch.logical_or(d[key] == 1, d[key] == 3))
-            # Whole Tumor (WT) = NCR + Edema + Enhancing Tumor
-            result.append(torch.logical_or(torch.logical_or(d[key] == 1, d[key] == 2), d[key] == 3))
-            # Enhancing Tumor (ET) = Enhancing Tumor (label 3)
-            result.append(d[key] == 3)
-            d[key] = torch.stack(result, axis=0).float()
-        return d
-
-
-def initialize_model_and_dataset():
-    """Initialize the segmentation model and dataset"""
-    global model, datalist
-    
-    # Check if model already initialized
-    if model is not None:
-        return
-    
-    # Create dataset.json if available
-    dataset_path = os.path.join(PYTHON_FOLDER, "dataset.json")
-    
-    # Check if dataset folder exists and has files
-    if os.path.exists(DATASET_FOLDER):
-        file_paths = glob.glob(os.path.join(DATASET_FOLDER, '*'))
-        file_paths.sort()
-        
-        if file_paths:
-            file_names = [os.path.basename(path) for path in file_paths]
-            file_names.sort()
-            
-            # Initialize lists for different MRI modalities and segmentation labels
-            t1c, t1n, t2f, t2w, label = [], [], [], [], []
-            
-            # Populate the lists with file paths
-            for i in range(len(file_paths)):
-                t1c.append(os.path.join(file_paths[i], file_names[i] + '-t1c.nii.gz'))
-                t1n.append(os.path.join(file_paths[i], file_names[i] + '-t1n.nii.gz'))
-                t2f.append(os.path.join(file_paths[i], file_names[i] + '-t2f.nii.gz'))
-                t2w.append(os.path.join(file_paths[i], file_names[i] + '-t2w.nii.gz'))
-                label.append(os.path.join(file_paths[i], file_names[i] + '-seg.nii.gz'))
-            
-            # Store in a dictionary with combined image modalities and separate label
-            file_list = []
-            for i in range(len(file_paths)):
-                file_list.append({
-                    "image": [t1c[i], t1n[i], t2f[i], t2w[i]],
-                    "label": label[i]
-                })
-            
-            file_json = {"training": file_list}
-            
-            # Save to JSON file
-            os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
-            with open(dataset_path, 'w') as json_file:
-                json.dump(file_json, json_file, indent=4)
-            
-            # Read the dataset
-            with open(dataset_path) as f:
-                datalist = json.load(f)["training"]
-    
-    # Initialize model
-    model_path = os.path.join(PYTHON_FOLDER, "best_distilled_model.pth")
-    
-    if os.path.exists(model_path):
-        # Define model
-        model = SwinUNETR(
-            img_size=(96, 96, 96),
-            in_channels=4,
-            out_channels=3,
-            feature_size=24,
-            use_checkpoint=True,
-        )
-        
-        # Load model weights
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model = model.to(device)
-        model.eval()
-        print("Model loaded successfully")
-    else:
-        print(f"Model file not found at {model_path}")
-
-
-def get_sample_by_id(idx):
-    """Get a sample from the dataset by ID"""
-    # Define transforms
-    val_transform = Compose([
-        LoadImaged(keys=["image", "label"]),
-        EnsureChannelFirstd(keys="image"),
-        EnsureTyped(keys=["image", "label"]),
-        ConvertLabels(keys="label"),
-        Orientationd(keys=["image", "label"], axcodes="RAS"),
-        Spacingd(
-            keys=["image", "label"],
-            pixdim=(1.0, 1.0, 1.0),
-            mode=("bilinear", "nearest"),
-        ),
-        NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-    ])
-    
-    val_ds = Dataset(data=[datalist[idx]], transform=val_transform)
-    return val_ds[0]
-
-
-# Route for GIF creation
-@app.route('/create_gif', methods=['POST'])
-def create_gifs():
-    try:
-        if 'nifti_file' not in request.files:
-            return jsonify({"error": "No nifti_file part"}), 400
-        
-        nifti_file = request.files['nifti_file']
-        nifti_filename = secure_filename(nifti_file.filename)
-        nifti_path = os.path.join(UPLOAD_FOLDER, nifti_filename)
-        nifti_file.save(nifti_path)
-
-        mask_path = None
-        if 'mask_file' in request.files:
-            mask_file = request.files['mask_file']
-            if mask_file.filename:
-                mask_filename = secure_filename(mask_file.filename)
-                mask_path = os.path.join(UPLOAD_FOLDER, mask_filename)
-                mask_file.save(mask_path)
-
-        # Create GIFs for different orientations
-        gif_urls = {}
-        base_url = request.host_url.rstrip('/')
-        for orientation in ['axial', 'sagittal', 'coronal']:
-            gif_filename = f'output_{orientation}_{os.path.splitext(nifti_filename)[0]}.gif'
-            gif_path = os.path.join(GIF_FOLDER, gif_filename)
-            create_gif_from_slices(nifti_path, mask_path, gif_path, orientation)
-            gif_urls[orientation] = f"{base_url}/gif/{gif_filename}"
-
-        return jsonify(gif_urls)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# Route for 3D model creation
-@app.route('/create_3d', methods=['POST'])
-def create_3d():
-    try:
-        if 'nifti_file' not in request.files:
-            return jsonify({"error": "No nifti_file part"}), 400
-        
-        nifti_file = request.files['nifti_file']
-        nifti_filename = secure_filename(nifti_file.filename)
-        nifti_path = os.path.join(UPLOAD_FOLDER, nifti_filename)
-        nifti_file.save(nifti_path)
-
-        mask_path = None
-        if 'mask_file' in request.files:
-            mask_file = request.files['mask_file']
-            if mask_file.filename:
-                mask_filename = secure_filename(mask_file.filename)
-                mask_path = os.path.join(UPLOAD_FOLDER, mask_filename)
-                mask_file.save(mask_path)
-        
-        # Create base filename for 3D models
-        output_base = os.path.splitext(nifti_filename)[0]
-        
-        # Generate 3D models
-        model_paths = create_3d_models(nifti_path, mask_path, output_base)
-        
-        # Create URLs for each model
-        base_url = request.host_url.rstrip('/')
-        model_urls = {model_type: f"{base_url}/model/{filename}" 
-                     for model_type, filename in model_paths.items()}
-        
-        return jsonify({"models": model_urls})
-        
-    except Exception as e:
-        print(f"Error creating 3D models: {e}")
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-
-# Route for segment prediction
 @app.route('/process_sample', methods=['POST'])
 def process_sample():
-    global model, datalist
-    
-    # Initialize model if not already done
-    if model is None or datalist is None:
-        try:
-            initialize_model_and_dataset()
-        except Exception as e:
-            return jsonify({'error': f'Model initialization failed: {str(e)}'}), 500
-    
-    # Check if we have data to process
-    if datalist is None:
-        return jsonify({'error': 'No dataset available'}), 500
-    
     data = request.json
     idx = int(data.get('id', 0))
     
@@ -403,20 +308,6 @@ def process_sample():
     try:
         # Get sample
         sample = get_sample_by_id(idx)
-        
-        # Post-processing
-        post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
-        
-        # Define color scheme
-        class_colors = [
-            [0.7, 0.7, 0.7, 1],        # Background (neutral gray)
-            [0.85, 0.37, 0.35, 0.7],   # Class 1 (rust red)
-            [0.46, 0.78, 0.56, 0.7],   # Class 2 (sage green)
-            [0.31, 0.51, 0.9, 0.7]     # Class 3 (medium blue)
-        ]
-        custom_cmap = ListedColormap(class_colors)
-        class_names = ["Tumor Core", "Whole Tumor", "Enhancing"]
-        class_cmaps = ['RdPu', 'BuGn', 'PuBu']
         
         with torch.no_grad():
             # Process input
@@ -541,43 +432,98 @@ def process_sample():
             })
             
     except Exception as e:
+        import traceback
         return jsonify({
             'error': str(e),
             'traceback': traceback.format_exc()
         }), 500
 
-
 @app.route('/dataset_info', methods=['GET'])
 def dataset_info():
     """Return information about the dataset"""
-    global datalist
-    
-    # Initialize model and dataset if not already done
-    if datalist is None:
-        try:
-            initialize_model_and_dataset()
-        except Exception as e:
-            return jsonify({'error': f'Dataset initialization failed: {str(e)}'}), 500
-    
-    if datalist is None:
-        return jsonify({'total_samples': 0, 'sample_filenames': []})
-    
     return jsonify({
         'total_samples': len(datalist),
         'sample_filenames': [os.path.basename(item['image'][0]).split('-')[0] for item in datalist]
     })
 
+@app.route('/create_gif', methods=['POST'])
+def create_gifs():
+    try:
+        if 'nifti_file' not in request.files:
+            return jsonify({"error": "No nifti_file part"}), 400
+        
+        nifti_file = request.files['nifti_file']
+        nifti_filename = secure_filename(nifti_file.filename)
+        nifti_path = os.path.join(UPLOAD_FOLDER, nifti_filename)
+        nifti_file.save(nifti_path)
 
-# Routes to serve static files
+        mask_path = None
+        if 'mask_file' in request.files:
+            mask_file = request.files['mask_file']
+            if mask_file.filename:
+                mask_filename = secure_filename(mask_file.filename)
+                mask_path = os.path.join(UPLOAD_FOLDER, mask_filename)
+                mask_file.save(mask_path)
+
+        # Create GIFs for different orientations
+        gif_urls = {}
+        base_url = request.host_url.rstrip('/')
+        for orientation in ['axial', 'sagittal', 'coronal']:
+            gif_filename = f'output_{orientation}_{os.path.splitext(nifti_filename)[0]}.gif'
+            gif_path = os.path.join(GIF_FOLDER, gif_filename)
+            create_gif_from_slices(nifti_path, mask_path, gif_path, orientation)
+            gif_urls[orientation] = f"{base_url}/gif/{gif_filename}"
+
+        return jsonify(gif_urls)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/create_3d', methods=['POST'])
+def create_3d():
+    try:
+        if 'nifti_file' not in request.files:
+            return jsonify({"error": "No nifti_file part"}), 400
+        
+        nifti_file = request.files['nifti_file']
+        nifti_filename = secure_filename(nifti_file.filename)
+        nifti_path = os.path.join(UPLOAD_FOLDER, nifti_filename)
+        nifti_file.save(nifti_path)
+
+        mask_path = None
+        if 'mask_file' in request.files:
+            mask_file = request.files['mask_file']
+            if mask_file.filename:
+                mask_filename = secure_filename(mask_file.filename)
+                mask_path = os.path.join(UPLOAD_FOLDER, mask_filename)
+                mask_file.save(mask_path)
+        
+        # Create base filename for 3D models
+        output_base = os.path.splitext(nifti_filename)[0]
+        
+        # Generate 3D models
+        model_paths = create_3d_models(nifti_path, mask_path, output_base)
+        
+        # Create URLs for each model
+        base_url = request.host_url.rstrip('/')
+        model_urls = {model_type: f"{base_url}/model/{filename}" 
+                     for model_type, filename in model_paths.items()}
+        
+        return jsonify({"models": model_urls})
+        
+    except Exception as e:
+        import traceback
+        print(f"Error creating 3D models: {e}")
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/gif/<filename>')
 def serve_gif(filename):
     return send_from_directory(GIF_FOLDER, filename)
 
-
 @app.route('/model/<filename>')
 def serve_model(filename):
     return send_from_directory(MODEL_FOLDER, filename)
-
 
 @app.route('/debug')
 def debug():
@@ -586,85 +532,30 @@ def debug():
         'upload_folder': UPLOAD_FOLDER,
         'gif_folder': GIF_FOLDER,
         'model_folder': MODEL_FOLDER,
-        'dataset_folder': DATASET_FOLDER,
-        'python_folder': PYTHON_FOLDER,
         'upload_exists': os.path.exists(UPLOAD_FOLDER),
         'gif_exists': os.path.exists(GIF_FOLDER),
         'model_exists': os.path.exists(MODEL_FOLDER),
-        'dataset_exists': os.path.exists(DATASET_FOLDER),
-        'python_exists': os.path.exists(PYTHON_FOLDER),
         'gifs': os.listdir(GIF_FOLDER) if os.path.exists(GIF_FOLDER) else [],
         'models': os.listdir(MODEL_FOLDER) if os.path.exists(MODEL_FOLDER) else [],
-        'device': str(device),
-        'has_model': model is not None,
-        'has_datalist': datalist is not None,
-        'datalist_length': len(datalist) if datalist else 0
+        'model_file_exists': os.path.exists(model_path),
+        'dataset_file_exists': os.path.exists(dataset_path),
+        'dataset_folder_exists': os.path.exists('./dataset'),
+        'num_dataset_files': len(file_paths1) if 'file_paths1' in locals() else 0
     })
 
-
 @app.route('/')
-def home():
-    return '''
-    <html>
-        <head>
-            <title>Brain MRI Visualization & Segmentation API</title>
-            <style>
-                body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-                h1 { color: #333; }
-                code { background-color: #f4f4f4; padding: 2px 4px; border-radius: 4px; }
-                pre { background-color: #f9f9f9; padding: 10px; border-radius: 5px; overflow-x: auto; }
-                .endpoint { margin-bottom: 30px; }
-            </style>
-        </head>
-        <body>
-            <h1>Brain MRI Visualization & Segmentation API</h1>
-            <p>This API provides endpoints for:</p>
-            <ul>
-                <li>Creating GIF visualizations from NIFTI files</li>
-                <li>Building 3D models from NIFTI files</li>
-                <li>Segmenting brain tumors using a pre-trained model</li>
-            </ul>
-            
-            <div class="endpoint">
-                <h2>1. Create GIFs</h2>
-                <p>POST to <code>/create_gif</code> with:</p>
-                <ul>
-                    <li><code>nifti_file</code>: The NIFTI file</li>
-                    <li><code>mask_file</code> (optional): A segmentation mask file</li>
-                </ul>
-            </div>
-            
-            <div class="endpoint">
-                <h2>2. Create 3D Models</h2>
-                <p>POST to <code>/create_3d</code> with:</p>
-                <ul>
-                    <li><code>nifti_file</code>: The NIFTI file</li>
-                    <li><code>mask_file</code> (optional): A segmentation mask file</li>
-                </ul>
-            </div>
-            
-            <div class="endpoint">
-                <h2>3. Process Sample (Tumor Segmentation)</h2>
-                <p>POST to <code>/process_sample</code> with JSON:</p>
-                <pre>{"id": 0}</pre>
-                <p>Where <code>id</code> is the index of the sample in the dataset.</p>
-            </div>
-            
-            <div class="endpoint">
-                <h2>4. Get Dataset Info</h2>
-                <p>GET <code>/dataset_info</code> to retrieve information about available samples.</p>
-            </div>
-            
-            <div class="endpoint">
-                <h2>5. Debug Info</h2>
-                <p>GET <code>/debug</code> to see system status and configuration.</p>
-            </div>
-        </body>
-    </html>
-    '''
-
+def index():
+    return jsonify({
+        'status': 'Server is running',
+        'endpoints': {
+            'process_sample': '/process_sample (POST)',
+            'dataset_info': '/dataset_info (GET)', 
+            'create_gif': '/create_gif (POST)',
+            'create_3d': '/create_3d (POST)',
+            'debug': '/debug (GET)'
+        }
+    })
 
 if __name__ == '__main__':
-    # Get port from environment (for Render compatibility)
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
