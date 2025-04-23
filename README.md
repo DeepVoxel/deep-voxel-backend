@@ -1,2 +1,1 @@
-# backend
-Backend for real-time inference
+# Inference and 3D model backend
