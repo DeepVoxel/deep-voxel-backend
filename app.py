@@ -170,7 +170,7 @@ model = SwinUNETR(
 )
 
 # Load model weights
-model_path = "best_distilled_model.pth"
+model_path = os.path.join(root_dir, "best_distilled_model.pth")
 model.load_state_dict(torch.load(model_path, map_location=device))
 model = model.to(device)
 model.eval()
