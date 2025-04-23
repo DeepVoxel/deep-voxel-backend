@@ -140,7 +140,7 @@ def create_3d_models(nifti_file, mask_file, output_base):
             for label, color in [
                 (1, [255, 0, 0, 255]),     # Necrotic core - Red
                 (2, [0, 255, 0, 255]),     # Peritumoral edema - Green
-                (3, [0, 0, 255, 255])      # Enhancing tumor - Blue (was Red in original)
+                (3, [255, 0, 0, 255])      # Enhancing tumor - Red
             ]:
                 # Extract this specific tumor type
                 tumor_region = np.zeros_like(img_normalized)
