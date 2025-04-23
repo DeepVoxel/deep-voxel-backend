@@ -26,7 +26,7 @@ from monai.inferers import sliding_window_inference
 from monai.networks.nets import SwinUNETR
 from monai.transforms import (
     Activations,
-    AsDiscrete,
+    AsDiscrete, 
     Compose,
     LoadImaged,
     MapTransform,
