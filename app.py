@@ -14,7 +14,7 @@ CORS(app)  # Enable CORS for all routes
 
 # Define absolute paths
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-STATIC_FOLDER = '/tmp/static'
+STATIC_FOLDER = './static'
 UPLOAD_FOLDER = os.path.join(STATIC_FOLDER, 'uploads')
 GIF_FOLDER = os.path.join(STATIC_FOLDER, 'gifs')
 MODEL_FOLDER = os.path.join(STATIC_FOLDER, 'models')
@@ -72,139 +72,70 @@ def create_gif_from_slices(nifti_file, mask_file, output_filename, orientation):
 
 def create_3d_models(nifti_file, mask_file, output_base):
     """Create a single 3D model: cutaway brain with tumor, fuller brain."""
-    print(f"Starting 3D model creation with {nifti_file} and {mask_file}")
-    
+    img_nii = nib.load(nifti_file)
+    img = img_nii.get_fdata()
+
+    if mask_file:
+        mask = nib.load(mask_file).get_fdata()
+    else:
+        mask = np.zeros_like(img)
+
+    # Store paths of created models
+    model_paths = {}
+
+    # APPROACH 1: Create a cutaway view of the brain (more conservative cut)
+    midpoint = img.shape[0] // 1  # Adjust midpoint to cut less of the brain
+    cutaway_mask = np.ones_like(img)
+    cutaway_mask[midpoint:, :, :] = 0  # Cut only a portion of the brain
+    cutaway_brain = img * cutaway_mask
+
     try:
-        img_nii = nib.load(nifti_file)
-        img = img_nii.get_fdata()
-        
-        # Downsample the image to reduce memory usage
-        downsample_factor = 2  # Reduce the image size to conserve memory
-        img_downsampled = img[::downsample_factor, ::downsample_factor, ::downsample_factor]
-        print(f"Original shape: {img.shape}, Downsampled shape: {img_downsampled.shape}")
-        
-        # Normalize image to 0-1 range
-        img_min, img_max = np.min(img_downsampled), np.max(img_downsampled)
-        img_normalized = (img_downsampled - img_min) / (img_max - img_min + 1e-10)
-        
-        if mask_file:
-            mask = nib.load(mask_file).get_fdata()
-            mask_downsampled = mask[::downsample_factor, ::downsample_factor, ::downsample_factor]
-        else:
-            mask_downsampled = np.zeros_like(img_downsampled)
-
-        # Store paths of created models
-        model_paths = {}
-
-        # APPROACH 1: Create a cutaway view of the brain (more conservative cut)
-        midpoint = img_downsampled.shape[0] // 2  # Cut in half for better visualization
-        cutaway_mask = np.ones_like(img_downsampled)
-        cutaway_mask[midpoint:, :, :] = 0  # Cut only a portion of the brain
-        cutaway_brain = img_normalized * cutaway_mask
-
-        print("Generating brain mesh with marching cubes...")
-        try:
-            # Use a lower threshold for better mesh generation
-            threshold = 0.3  # Lower threshold may capture more of the brain structure
-            brain_verts, brain_faces, brain_normals, _ = measure.marching_cubes(cutaway_brain, level=threshold)
-            
-            print(f"Brain mesh generated: {len(brain_verts)} vertices, {len(brain_faces)} faces")
-            
-            # Create the brain mesh with simplified geometry (fewer triangles)
-            brain_mesh = trimesh.Trimesh(vertices=brain_verts, faces=brain_faces, vertex_normals=brain_normals)
-            
-            # Simplify the mesh to reduce file size and memory usage (if it has enough faces)
-            if len(brain_faces) > 5000:
-                target_faces = min(len(brain_faces) // 2, 10000)  # Reduce to 50% or max 10K faces
-                print(f"Simplifying brain mesh from {len(brain_faces)} to ~{target_faces} faces")
-                brain_mesh = brain_mesh.simplify_quadratic_decimation(target_faces)
-            
-            brain_mesh.visual.face_colors = [220, 220, 220, 255]  # Light gray
-            
-            # Export just the brain mesh first as a test
-            brain_only_filename = f"{output_base}_brain_only.ply"
-            brain_only_path = os.path.join(MODEL_FOLDER, brain_only_filename)
-            brain_mesh.export(brain_only_path)
-            model_paths['brain_only'] = brain_only_filename
-            print(f"Exported brain mesh to {brain_only_path}")
-            
-        except Exception as e:
-            print(f"Failed to create brain mesh: {e}")
-            import traceback
-            print(traceback.format_exc())
-            return model_paths  # Return early if we can't create the brain mesh
-        
-        # APPROACH 2: Create a mesh for just the tumor with bright colors
-        tumor_meshes = []
-        if mask_file is not None:
-            for label, color in [
-                (1, [255, 0, 0, 255]),     # Necrotic core - Red
-                (2, [0, 255, 0, 255]),     # Peritumoral edema - Green
-                (3, [255, 0, 0, 255])      # Enhancing tumor - Red
-            ]:
-                # Extract this specific tumor type
-                tumor_region = np.zeros_like(img_normalized)
-                tumor_region[mask_downsampled == label] = 1.0  # Binary mask is more stable
-                
-                # Only proceed if this tumor type exists and has enough voxels
-                if np.sum(tumor_region) > 10:  # Ensure there are enough voxels
-                    try:
-                        print(f"Generating tumor mesh for label {label}...")
-                        # Create mesh for this tumor type with a lower threshold
-                        tumor_verts, tumor_faces, tumor_normals, _ = measure.marching_cubes(tumor_region, level=0.5)
-                        
-                        # Only proceed if we got enough vertices
-                        if len(tumor_verts) > 0 and len(tumor_faces) > 0:
-                            tumor_mesh = trimesh.Trimesh(vertices=tumor_verts, faces=tumor_faces, vertex_normals=tumor_normals)
-                            
-                            # Simplify tumor mesh if needed
-                            if len(tumor_faces) > 5000:
-                                tumor_mesh = tumor_mesh.simplify_quadratic_decimation(min(len(tumor_faces) // 2, 5000))
-                            
-                            # Color the tumor mesh
-                            tumor_mesh.visual.face_colors = color
-                            
-                            # Add to our collection
-                            tumor_meshes.append(tumor_mesh)
-                            print(f"Created tumor mesh for label {label}: {len(tumor_verts)} vertices")
-                            
-                            # Export individual tumor meshes for debugging
-                            tumor_filename = f"{output_base}_tumor_label_{label}.ply"
-                            tumor_path = os.path.join(MODEL_FOLDER, tumor_filename)
-                            tumor_mesh.export(tumor_path)
-                            model_paths[f'tumor_label_{label}'] = tumor_filename
-                            
-                    except Exception as e:
-                        print(f"Failed to create mesh for tumor type {label}: {e}")
-                        import traceback
-                        print(traceback.format_exc())
-            
-            # Export all the different visualizations
-            # 1. Cutaway brain with tumors
-            if tumor_meshes:
-                try:
-                    print("Combining brain and tumor meshes...")
-                    combined_cutaway = trimesh.util.concatenate([brain_mesh] + tumor_meshes)
-                    
-                    combined_cutaway_filename = f"{output_base}_brain_cutaway_with_tumor.ply"
-                    combined_cutaway_path = os.path.join(MODEL_FOLDER, combined_cutaway_filename)
-                    
-                    print(f"Exporting combined mesh with {len(combined_cutaway.vertices)} vertices")
-                    combined_cutaway.export(combined_cutaway_path)
-                    model_paths['brain_cutaway_with_tumor'] = combined_cutaway_filename
-                    print(f"Created cutaway brain with tumors: {combined_cutaway_path}")
-                except Exception as e:
-                    print(f"Failed to create combined mesh: {e}")
-                    import traceback
-                    print(traceback.format_exc())
-
-        return model_paths
-        
+        # Create the cutaway brain mesh
+        brain_verts, brain_faces, brain_normals, _ = measure.marching_cubes(cutaway_brain, level=0.5)
+        brain_mesh = trimesh.Trimesh(vertices=brain_verts, faces=brain_faces, vertex_normals=brain_normals)
+        brain_mesh.visual.face_colors = [220, 220, 220, 255]  # Light gray
     except Exception as e:
-        print(f"Exception in create_3d_models: {e}")
-        import traceback
-        print(traceback.format_exc())
-        return {}
+        print(f"Failed to create brain mesh: {e}")
+        return model_paths # if no brain mesh, no other meshes.
+
+    # APPROACH 2: Create a mesh for just the tumor with bright colors
+    tumor_meshes = []
+    if mask_file is not None:
+        for label, color in [
+            (1, [255, 0, 0, 255]),     # Necrotic core - Red
+            (2, [0, 255, 0, 255]),     # Peritumoral edema - Green
+            (3, [255, 0, 0, 255])      # Enhancing tumor - Blue
+        ]:
+            # Extract this specific tumor type
+            tumor_region = np.zeros_like(img)
+            tumor_region[mask == label] = img[mask == label]
+
+            # Only proceed if this tumor type exists
+            if np.sum(tumor_region) > 0:
+                try:
+                    # Create mesh for this tumor type
+                    tumor_verts, tumor_faces, tumor_normals, _ = measure.marching_cubes(tumor_region, level=0.3)
+                    tumor_mesh = trimesh.Trimesh(vertices=tumor_verts, faces=tumor_faces, vertex_normals=tumor_normals)
+
+                    # Color the tumor mesh
+                    tumor_mesh.visual.face_colors = color
+
+                    # Add to our collection
+                    tumor_meshes.append(tumor_mesh)
+                except Exception as e:
+                    print(f"Failed to create mesh for tumor type {label} - may not exist: {e}")
+
+        # Export all the different visualizations
+        # 1. Cutaway brain with tumors
+        if tumor_meshes:
+            combined_cutaway = trimesh.util.concatenate([brain_mesh] + tumor_meshes)
+            combined_cutaway_filename = f"{output_base}_brain_cutaway_with_tumor.ply"
+            combined_cutaway_path = os.path.join(MODEL_FOLDER, combined_cutaway_filename)
+            combined_cutaway.export(combined_cutaway_path)
+            model_paths['brain_cutaway_with_tumor'] = combined_cutaway_filename
+            print("Created cutaway brain with tumors")
+
+    return model_paths
 
 
 @app.route('/create_gif', methods=['POST'])
