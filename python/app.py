@@ -14,8 +14,8 @@ CORS(app)  # Enable CORS for all routes
 
 # Define absolute paths
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-STATIC_FOLDER = os.path.join(BASE_DIR, 'static')
+STATIC_FOLDER = '/tmp/static'
+UPLOAD_FOLDER = os.path.join(STATIC_FOLDER, 'uploads')
 GIF_FOLDER = os.path.join(STATIC_FOLDER, 'gifs')
 MODEL_FOLDER = os.path.join(STATIC_FOLDER, 'models')
 
@@ -27,6 +27,7 @@ os.makedirs(MODEL_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['GIF_FOLDER'] = GIF_FOLDER
 app.config['MODEL_FOLDER'] = MODEL_FOLDER
+
 
 class ImageToGIF:
     def __init__(self):
@@ -103,7 +104,7 @@ def create_3d_models(nifti_file, mask_file, output_base):
         for label, color in [
             (1, [255, 0, 0, 255]),     # Necrotic core - Red
             (2, [0, 255, 0, 255]),     # Peritumoral edema - Green
-            (4, [0, 0, 255, 255])      # Enhancing tumor - Blue
+            (3, [255, 0, 0, 255])      # Enhancing tumor - Blue
         ]:
             # Extract this specific tumor type
             tumor_region = np.zeros_like(img)
